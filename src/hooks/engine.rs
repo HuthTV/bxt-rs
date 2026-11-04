@@ -2345,6 +2345,7 @@ pub mod exported {
             let marker = MainThreadMarker::new();
 
             campath::load(marker);
+            demo_playback::on_cl_playdemo_f(marker);
 
             CL_ViewDemo_f.get(marker)();
         })
@@ -2667,6 +2668,7 @@ pub mod exported {
 
             capture_video_per_demo::on_before_cl_playdemo_f(marker);
             campath::load(marker);
+            demo_playback::on_cl_playdemo_f(marker);
 
             CL_PlayDemo_f.get(marker)();
 

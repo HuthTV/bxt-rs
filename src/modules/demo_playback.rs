@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use byte_slice_cast::AsSliceOf;
 
-use super::commands::Command;
+use super::commands::{self, Command};
 use super::Module;
 use crate::handler;
 use crate::hooks::engine::{self, con_print, prepend_command};
@@ -22,7 +22,7 @@ impl Module for DemoPlayback {
     }
 
     fn commands(&self) -> &'static [&'static Command] {
-        static COMMANDS: &[&Command] = &[&BXT_PLAY_RUN, &BXT_PLAY_FOLDER];
+        static COMMANDS: &[&Command] = &[&BXT_PLAY_RUN, &BXT_PLAY_FOLDER, &BXT_DEMO_RESTART];
         COMMANDS
     }
 
@@ -35,6 +35,9 @@ impl Module for DemoPlayback {
 }
 
 static DEMOS: MainThreadRefCell<Vec<Vec<u8>>> = MainThreadRefCell::new(Vec::new());
+static NEXT: MainThreadRefCell<Option<Vec<u8>>> = MainThreadRefCell::new(None);     //`Host_NextDemo()` will play next (from `cls.demos`).
+static PLAYING: MainThreadRefCell<Option<Vec<u8>>> = MainThreadRefCell::new(None);  // The queued demo that `Host_NextDemo()` started last.
+static LAST_DEMO: MainThreadRefCell<Option<(String, String)>> = MainThreadRefCell::new(None);   /// The command (`playdemo`, `viewdemo` or `timedemo`) and demo name of the last demo started.
 
 static BXT_PLAY_RUN: Command = Command::new(
     b"bxt_play_run\0",
@@ -55,6 +58,16 @@ static BXT_PLAY_FOLDER: Command = Command::new(
         
 Plays back all demos in the folder in alphabetic order.",
         play_folder as fn(_, _)
+    ),
+);
+
+static BXT_DEMO_RESTART: Command = Command::new(
+    b"bxt_demo_restart\0",
+    handler!(
+        "bxt_demo_restart
+
+Restarts the last played demo from its beginning, with the command that started it.",
+        demo_restart as fn(_)
     ),
 );
 
@@ -104,6 +117,67 @@ where
     });
 
     queue_for_playing(marker, paths);
+}
+
+fn demo_restart(marker: MainThreadMarker) {
+    if !DemoPlayback.is_enabled(marker) {
+        return;
+    }
+
+    let Some((command, name)) = LAST_DEMO.borrow(marker).clone() else {
+        con_print(marker, "Error: no demo has been played yet.\n");
+        return;
+    };
+
+    con_print(marker, &format!("Restarting {name}.\n"));
+
+    // Host_NextDemo() starts queued demos with playdemo. Any other demo is not in the queue.
+    let queued = command.eq_ignore_ascii_case("playdemo")
+        && PLAYING.borrow(marker).as_deref().map(demo_name) == Some(name.clone());
+    if !queued {
+        prepend_command(marker, &format!("{command} \"{name}\"\n"));
+        return;
+    }
+
+    let demo = PLAYING.borrow(marker).clone().unwrap();
+
+    // Put the current demo back in front of the queue, before the one that was going to play next.
+    let mut demos = DEMOS.borrow_mut(marker);
+    if let Some(next) = NEXT.borrow_mut(marker).take() {
+        demos.push(next);
+    }
+    demos.push(demo);
+    drop(demos);
+
+    load_next_demo(marker);
+    prepend_command(marker, "demos\n");
+}
+
+/// Called before `CL_PlayDemo_f()` (which `timedemo` also calls) and `CL_ViewDemo_f()`.
+///
+/// # Safety
+///
+/// Must only be called from within the console command handler.
+pub unsafe fn on_cl_playdemo_f(marker: MainThreadMarker) {
+    if !engine::Cmd_Argc.is_set(marker) || !engine::Cmd_Argv.is_set(marker) {
+        return;
+    }
+
+    let mut args = commands::Args::new(marker);
+    let (Some(command), Some(name)) = (args.next(), args.next()) else {
+        // Printing the usage, nothing is played.
+        return;
+    };
+
+    *LAST_DEMO.borrow_mut(marker) = Some((
+        command.to_string_lossy().into_owned(),
+        name.to_string_lossy().into_owned(),
+    ));
+}
+
+/// Returns the printable name of a null-terminated demo name.
+fn demo_name(demo: &[u8]) -> String {
+    String::from_utf8_lossy(demo.strip_suffix(&[0]).unwrap_or(demo)).into_owned()
 }
 
 fn demos_in_folder(dir: &Path) -> Result<impl Iterator<Item = PathBuf>, String> {
@@ -194,19 +268,33 @@ pub fn queue_for_playing(
     con_print(marker, &format!("Playing {} demos.\n", demos.len()));
 
     drop(demos);
-    set_next_demo(marker);
+    load_next_demo(marker);
 
     prepend_command(marker, "demos\n");
 }
 
+/// Called after `Host_NextDemo()`.
 pub fn set_next_demo(marker: MainThreadMarker) {
+    // Host_NextDemo() sets demonum to -1 when it had nothing to play.
+    let started = unsafe { (*engine::cls_demos.get(marker)).demonum != -1 };
+    if started {
+        // None if the demo is not one of ours, e.g. from the game's own startdemos.
+        *PLAYING.borrow_mut(marker) = NEXT.borrow_mut(marker).take();
+    }
+
+    load_next_demo(marker);
+}
+
+fn load_next_demo(marker: MainThreadMarker) {
     let mut demos = DEMOS.borrow_mut(marker);
+    let next = demos.pop();
+    *NEXT.borrow_mut(marker) = next.clone();
 
     unsafe {
         // Safety: no engine functions are called while the reference is active.
         let cls_demos = &mut *engine::cls_demos.get(marker);
 
-        match demos.pop() {
+        match next {
             Some(demo) => {
                 // Zero the whole array out so we don't have to deal with tracking the final byte.
                 cls_demos.demos.fill([0; 16]);
